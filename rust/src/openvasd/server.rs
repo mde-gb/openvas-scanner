@@ -538,3 +538,72 @@ pub async fn serve<'a>(app_state: &'a AppState<'a>) -> Result<i32> {
 
     Ok(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use rustls::pki_types::pem::PemObject;
+
+    use super::*;
+
+    fn ensure_crypto_provider() {
+        if CryptoProvider::get_default().is_none() {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        }
+    }
+
+    fn cert(bytes: &'static [u8]) -> CertificateDer<'static> {
+        CertificateDer::pem_slice_iter(bytes)
+            .next()
+            .unwrap()
+            .unwrap()
+    }
+
+    fn ca_cert() -> CertificateDer<'static> {
+        cert(include_bytes!("test-data/ca.pem"))
+    }
+
+    fn pinned_client_cert() -> CertificateDer<'static> {
+        cert(include_bytes!("test-data/pinned-client.pem"))
+    }
+
+    fn other_client_cert() -> CertificateDer<'static> {
+        cert(include_bytes!("test-data/other-client.pem"))
+    }
+
+    fn verify_client_cert(
+        verifier: &dyn ClientCertVerifier,
+        cert: &CertificateDer<'_>,
+    ) -> std::result::Result<ClientCertVerified, RustlsError> {
+        verifier.verify_client_cert(cert, &[], UnixTime::now())
+    }
+
+    #[test]
+    fn ca_client_verifier_accepts_ca_issued_client_cert() {
+        ensure_crypto_provider();
+        let verifier = build_client_cert_verifier(vec![ca_cert()], vec![])
+            .unwrap()
+            .unwrap();
+
+        assert!(verify_client_cert(verifier.as_ref(), &pinned_client_cert()).is_ok());
+    }
+
+    #[test]
+    fn pinned_client_verifier_accepts_exact_leaf_without_ca() {
+        ensure_crypto_provider();
+        let verifier = build_client_cert_verifier(vec![], vec![pinned_client_cert()])
+            .unwrap()
+            .unwrap();
+
+        assert!(verify_client_cert(verifier.as_ref(), &pinned_client_cert()).is_ok());
+    }
+
+    #[test]
+    fn pinned_client_verifier_rejects_unpinned_leaf() {
+        ensure_crypto_provider();
+        let verifier = build_client_cert_verifier(vec![], vec![pinned_client_cert()])
+            .unwrap()
+            .unwrap();
+
+        assert!(verify_client_cert(verifier.as_ref(), &other_client_cert()).is_err());
+    }
+}
