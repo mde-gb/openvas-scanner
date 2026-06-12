@@ -596,6 +596,17 @@ mod tests {
     }
 
     #[test]
+    fn ca_and_pinned_client_verifier_accepts_ca_issued_client_cert() {
+        ensure_crypto_provider();
+        let verifier = build_client_cert_verifier(vec![ca_cert()], vec![pinned_client_cert()])
+            .unwrap()
+            .unwrap();
+
+        assert!(verify_client_cert(verifier.as_ref(), &pinned_client_cert()).is_ok());
+        assert!(verify_client_cert(verifier.as_ref(), &other_client_cert()).is_ok());
+    }
+
+    #[test]
     fn pinned_client_verifier_accepts_exact_leaf_without_ca() {
         ensure_crypto_provider();
         let verifier = build_client_cert_verifier(vec![], vec![pinned_client_cert()])
