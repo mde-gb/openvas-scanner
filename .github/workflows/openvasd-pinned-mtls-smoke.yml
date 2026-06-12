@@ -47,6 +47,24 @@ jobs:
           set -euo pipefail
 
           mkdir -p smoke-certs/pinned
+          cat > smoke-certs/server.ext <<'EOF'
+          basicConstraints = critical,CA:FALSE
+          keyUsage = critical,digitalSignature,keyEncipherment
+          extendedKeyUsage = serverAuth
+          subjectAltName = DNS:localhost,IP:127.0.0.1
+          EOF
+          cat > smoke-certs/client-ca.ext <<'EOF'
+          basicConstraints = critical,CA:TRUE
+          keyUsage = critical,keyCertSign,cRLSign
+          subjectKeyIdentifier = hash
+          EOF
+          cat > smoke-certs/client.ext <<'EOF'
+          basicConstraints = critical,CA:FALSE
+          keyUsage = critical,digitalSignature
+          extendedKeyUsage = clientAuth
+          subjectKeyIdentifier = hash
+          authorityKeyIdentifier = keyid,issuer
+          EOF
 
           openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
             -subj "/CN=openvasd-smoke-server-ca" \
@@ -63,11 +81,13 @@ jobs:
             -CA smoke-certs/server-ca.pem \
             -CAkey smoke-certs/server-ca.key \
             -CAcreateserial \
-            -copy_extensions copy \
+            -extfile smoke-certs/server.ext \
             -out smoke-certs/server.pem
 
           openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
             -subj "/CN=openvasd-smoke-untrusted-client-ca" \
+            -addext "basicConstraints=critical,CA:TRUE" \
+            -addext "keyUsage=critical,keyCertSign,cRLSign" \
             -keyout smoke-certs/untrusted-client-ca.key \
             -out smoke-certs/untrusted-client-ca.pem
 
@@ -80,6 +100,7 @@ jobs:
             -CA smoke-certs/untrusted-client-ca.pem \
             -CAkey smoke-certs/untrusted-client-ca.key \
             -CAcreateserial \
+            -extfile smoke-certs/client.ext \
             -out smoke-certs/pinned-client.pem
           cp smoke-certs/pinned-client.pem smoke-certs/pinned/pinned-client.pem
 
@@ -92,6 +113,7 @@ jobs:
             -CA smoke-certs/untrusted-client-ca.pem \
             -CAkey smoke-certs/untrusted-client-ca.key \
             -CAcreateserial \
+            -extfile smoke-certs/client.ext \
             -out smoke-certs/unpinned-client.pem
 
       - name: verify pinned mTLS behavior
