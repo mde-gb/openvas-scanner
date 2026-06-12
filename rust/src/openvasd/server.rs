@@ -23,11 +23,12 @@ use futures::future::BoxFuture;
 use rustls::{
     DigitallySignedStruct, DistinguishedName, Error as RustlsError, RootCertStore, ServerConfig,
     SignatureScheme,
+    client::danger::HandshakeSignatureValid,
     crypto::CryptoProvider,
     pki_types::{CertificateDer, PrivateKeyDer, UnixTime, pem::PemObject},
     server::{
         WebPkiClientVerifier,
-        danger::{ClientCertVerified, ClientCertVerifier, HandshakeSignatureValid},
+        danger::{ClientCertVerified, ClientCertVerifier},
     },
 };
 use tokio::{
