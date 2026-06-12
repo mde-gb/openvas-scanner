@@ -267,6 +267,7 @@ fn load_client_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
 struct PinnedClientCertVerifier {
     ca_verifier: Option<Arc<dyn ClientCertVerifier>>,
     signature_verifier: Arc<dyn ClientCertVerifier>,
+    root_hint_subjects: Vec<DistinguishedName>,
     pinned_certs: HashSet<Vec<u8>>,
 }
 
@@ -276,9 +277,15 @@ impl PinnedClientCertVerifier {
         signature_verifier: Arc<dyn ClientCertVerifier>,
         pinned_certs: Vec<CertificateDer<'static>>,
     ) -> Self {
+        let root_hint_subjects = ca_verifier
+            .as_ref()
+            .map(|verifier| verifier.root_hint_subjects().to_vec())
+            .unwrap_or_default();
+
         Self {
             ca_verifier,
             signature_verifier,
+            root_hint_subjects,
             pinned_certs: pinned_certs
                 .into_iter()
                 .map(|cert| cert.as_ref().to_vec())
@@ -297,7 +304,7 @@ impl ClientCertVerifier for PinnedClientCertVerifier {
     }
 
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        self.signature_verifier.root_hint_subjects()
+        &self.root_hint_subjects
     }
 
     fn verify_client_cert(
