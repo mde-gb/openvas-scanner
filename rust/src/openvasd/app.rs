@@ -31,7 +31,9 @@ pub struct HealthHeaders {
 impl HealthHeaders {
     pub fn from_appstate(app_state: &AppState<'_>) -> Self {
         Self {
-            authentication: if app_state.config.tls.client_certs.is_some() {
+            authentication: if app_state.config.tls.client_certs.is_some()
+                || app_state.config.tls.pinned_client_certs.is_some()
+            {
                 "mTLS"
             } else if app_state.config.endpoints.key.is_some() {
                 "api-key"

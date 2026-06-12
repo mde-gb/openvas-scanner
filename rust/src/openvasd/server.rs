@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     io::{self, BufRead},
     path::{Path, PathBuf},
@@ -20,10 +21,14 @@ use axum_server::{
 };
 use futures::future::BoxFuture;
 use rustls::{
-    RootCertStore, ServerConfig,
+    DigitallySignedStruct, DistinguishedName, Error as RustlsError, RootCertStore, ServerConfig,
+    SignatureScheme,
     crypto::CryptoProvider,
-    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
-    server::WebPkiClientVerifier,
+    pki_types::{CertificateDer, PrivateKeyDer, UnixTime, pem::PemObject},
+    server::{
+        WebPkiClientVerifier,
+        danger::{ClientCertVerified, ClientCertVerifier, HandshakeSignatureValid},
+    },
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -208,23 +213,175 @@ where
     Err(error(format!("No key found {filename:?}")))
 }
 
-fn load_client_cert_paths(path: &Path) -> Vec<PathBuf> {
-    let entries = match std::fs::read_dir(path) {
-        Ok(x) => x,
-        Err(_) => return vec![],
-    };
+fn load_client_cert_paths(path: &Path) -> io::Result<Vec<PathBuf>> {
+    let metadata = std::fs::metadata(path).map_err(|e| {
+        error(format!(
+            "failed to read client certificate path {path:?}: {e}"
+        ))
+    })?;
 
-    entries
-        .filter_map(|x| {
-            let entry = x.ok()?;
-            let file_type = entry.file_type().ok()?;
-            if file_type.is_file() || file_type.is_symlink() && !file_type.is_dir() {
-                Some(entry.path())
-            } else {
-                None
-            }
+    if metadata.is_file() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+
+    if !metadata.is_dir() {
+        return Err(error(format!(
+            "client certificate path {path:?} is neither a file nor a directory"
+        )));
+    }
+
+    std::fs::read_dir(path)?
+        .filter_map(|x| match x {
+            Ok(entry) => match entry.file_type() {
+                Ok(file_type) if file_type.is_file() || file_type.is_symlink() => {
+                    Some(Ok(entry.path()))
+                }
+                Ok(_) => None,
+                Err(e) => Some(Err(e)),
+            },
+            Err(e) => Some(Err(e)),
         })
         .collect()
+}
+
+fn load_client_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
+    let certs = load_client_cert_paths(path)?
+        .iter()
+        .map(load_certs)
+        .collect::<io::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+    if certs.is_empty() {
+        return Err(error(format!(
+            "No client certificates found in {path:?}; mTLS would not authenticate clients"
+        )));
+    }
+
+    Ok(certs)
+}
+
+#[derive(Debug)]
+struct PinnedClientCertVerifier {
+    ca_verifier: Option<Arc<dyn ClientCertVerifier>>,
+    signature_verifier: Arc<dyn ClientCertVerifier>,
+    pinned_certs: HashSet<Vec<u8>>,
+}
+
+impl PinnedClientCertVerifier {
+    fn new(
+        ca_verifier: Option<Arc<dyn ClientCertVerifier>>,
+        signature_verifier: Arc<dyn ClientCertVerifier>,
+        pinned_certs: Vec<CertificateDer<'static>>,
+    ) -> Self {
+        Self {
+            ca_verifier,
+            signature_verifier,
+            pinned_certs: pinned_certs
+                .into_iter()
+                .map(|cert| cert.as_ref().to_vec())
+                .collect(),
+        }
+    }
+}
+
+impl ClientCertVerifier for PinnedClientCertVerifier {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        true
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        self.signature_verifier.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> std::result::Result<ClientCertVerified, RustlsError> {
+        if let Some(ca_verifier) = &self.ca_verifier {
+            match ca_verifier.verify_client_cert(end_entity, intermediates, now) {
+                Ok(verified) => return Ok(verified),
+                Err(error) if !self.pinned_certs.contains(end_entity.as_ref()) => {
+                    return Err(error);
+                }
+                Err(_) => {}
+            }
+        }
+
+        if self.pinned_certs.contains(end_entity.as_ref()) {
+            Ok(ClientCertVerified::assertion())
+        } else {
+            Err(RustlsError::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        self.signature_verifier
+            .verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        self.signature_verifier
+            .verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.signature_verifier.supported_verify_schemes()
+    }
+}
+
+fn build_client_cert_verifier(
+    ca_certs: Vec<CertificateDer<'static>>,
+    pinned_certs: Vec<CertificateDer<'static>>,
+) -> Result<Option<Arc<dyn ClientCertVerifier>>> {
+    if ca_certs.is_empty() && pinned_certs.is_empty() {
+        return Ok(None);
+    }
+
+    let mut signature_roots = RootCertStore::empty();
+    for cert in ca_certs.iter().chain(pinned_certs.iter()).cloned() {
+        signature_roots.add(cert)?;
+    }
+
+    let signature_verifier = WebPkiClientVerifier::builder(signature_roots.into()).build()?;
+    if pinned_certs.is_empty() {
+        return Ok(Some(signature_verifier));
+    }
+
+    let ca_verifier = if ca_certs.is_empty() {
+        None
+    } else {
+        let mut ca_roots = RootCertStore::empty();
+        for cert in ca_certs {
+            ca_roots.add(cert)?;
+        }
+        Some(WebPkiClientVerifier::builder(ca_roots.into()).build()?)
+    };
+
+    Ok(Some(Arc::new(PinnedClientCertVerifier::new(
+        ca_verifier,
+        signature_verifier,
+        pinned_certs,
+    ))))
 }
 
 fn rustls_config(config: &Config) -> Result<Option<TlsSetup>> {
@@ -237,22 +394,26 @@ fn rustls_config(config: &Config) -> Result<Option<TlsSetup>> {
         return Ok(None);
     };
 
-    let mut roots = RootCertStore::empty();
-    if let Some(client_certs) = config.tls.client_certs.as_ref() {
-        for root in load_client_cert_paths(client_certs)
-            .iter()
-            .flat_map(load_certs)
-            .flatten()
-        {
-            roots.add(root)?;
-        }
-    }
+    let ca_certs = config
+        .tls
+        .client_certs
+        .as_deref()
+        .map(load_client_certs)
+        .transpose()?
+        .unwrap_or_default();
+    let pinned_certs = config
+        .tls
+        .pinned_client_certs
+        .as_deref()
+        .map(load_client_certs)
+        .transpose()?
+        .unwrap_or_default();
+    let client_cert_verifier = build_client_cert_verifier(ca_certs, pinned_certs)?;
 
     let key = load_private_key(key_path)?;
     let certs = load_certs(cert_path)?;
 
-    let mut server_config = if !roots.is_empty() {
-        let verifier = WebPkiClientVerifier::builder(roots.into()).build()?;
+    let mut server_config = if let Some(verifier) = client_cert_verifier {
         ServerConfig::builder()
             .with_client_cert_verifier(verifier)
             .with_single_cert(certs, key)?
@@ -264,7 +425,7 @@ fn rustls_config(config: &Config) -> Result<Option<TlsSetup>> {
     server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     let rustls_config = RustlsConfig::from_config(Arc::new(server_config));
-    if config.tls.client_certs.is_some() {
+    if config.tls.client_certs.is_some() || config.tls.pinned_client_certs.is_some() {
         Ok(Some(TlsSetup::Mtls(MtlsSnitchAcceptor::new(
             RustlsAcceptor::new(rustls_config),
         ))))
