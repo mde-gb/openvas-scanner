@@ -39,6 +39,7 @@ use tokio::{
 };
 use tokio_rustls::server::TlsStream;
 use tower::Layer;
+use x509_parser::time::ASN1Time;
 
 use crate::{
     app::{AppState, HealthHeaders},
@@ -263,6 +264,56 @@ fn load_client_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
     Ok(certs)
 }
 
+fn unix_time_to_asn1_time(now: UnixTime) -> std::result::Result<ASN1Time, RustlsError> {
+    let secs = i64::try_from(now.as_secs())
+        .map_err(|_| RustlsError::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
+    ASN1Time::from_timestamp(secs)
+        .map_err(|_| RustlsError::InvalidCertificate(rustls::CertificateError::BadEncoding))
+}
+
+fn validate_pinned_client_cert(
+    end_entity: &CertificateDer<'_>,
+    now: UnixTime,
+) -> std::result::Result<(), RustlsError> {
+    let (_, cert) = x509_parser::parse_x509_certificate(end_entity.as_ref())
+        .map_err(|_| RustlsError::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
+    let now = unix_time_to_asn1_time(now)?;
+    let validity = cert.validity();
+
+    if now < validity.not_before {
+        return Err(RustlsError::InvalidCertificate(
+            rustls::CertificateError::NotValidYet,
+        ));
+    }
+    if now > validity.not_after {
+        return Err(RustlsError::InvalidCertificate(
+            rustls::CertificateError::Expired,
+        ));
+    }
+
+    if cert
+        .basic_constraints()
+        .map_err(|_| RustlsError::InvalidCertificate(rustls::CertificateError::BadEncoding))?
+        .is_some_and(|extension| extension.value.ca)
+    {
+        return Err(RustlsError::InvalidCertificate(
+            rustls::CertificateError::InvalidPurpose,
+        ));
+    }
+
+    if !cert
+        .extended_key_usage()
+        .map_err(|_| RustlsError::InvalidCertificate(rustls::CertificateError::BadEncoding))?
+        .is_some_and(|extension| extension.value.client_auth)
+    {
+        return Err(RustlsError::InvalidCertificate(
+            rustls::CertificateError::InvalidPurpose,
+        ));
+    }
+
+    Ok(())
+}
+
 #[derive(Debug)]
 struct PinnedClientCertVerifier {
     ca_verifier: Option<Arc<dyn ClientCertVerifier>>,
@@ -324,6 +375,7 @@ impl ClientCertVerifier for PinnedClientCertVerifier {
         }
 
         if self.pinned_certs.contains(end_entity.as_ref()) {
+            validate_pinned_client_cert(end_entity, now)?;
             Ok(ClientCertVerified::assertion())
         } else {
             Err(RustlsError::InvalidCertificate(
@@ -549,6 +601,8 @@ pub async fn serve<'a>(app_state: &'a AppState<'a>) -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use rustls::pki_types::pem::PemObject;
 
     use super::*;
@@ -583,6 +637,18 @@ mod tests {
         cert: &CertificateDer<'_>,
     ) -> std::result::Result<ClientCertVerified, RustlsError> {
         verifier.verify_client_cert(cert, &[], UnixTime::now())
+    }
+
+    fn verify_client_cert_at(
+        verifier: &dyn ClientCertVerifier,
+        cert: &CertificateDer<'_>,
+        seconds_since_epoch: u64,
+    ) -> std::result::Result<ClientCertVerified, RustlsError> {
+        verifier.verify_client_cert(
+            cert,
+            &[],
+            UnixTime::since_unix_epoch(Duration::from_secs(seconds_since_epoch)),
+        )
     }
 
     #[test]
@@ -624,5 +690,39 @@ mod tests {
             .unwrap();
 
         assert!(verify_client_cert(verifier.as_ref(), &other_client_cert()).is_err());
+    }
+
+    #[test]
+    fn pinned_client_verifier_rejects_pinned_leaf_before_not_before() {
+        ensure_crypto_provider();
+        let verifier = build_client_cert_verifier(vec![], vec![pinned_client_cert()])
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            verify_client_cert_at(verifier.as_ref(), &pinned_client_cert(), 1781288257).is_err()
+        );
+    }
+
+    #[test]
+    fn pinned_client_verifier_rejects_pinned_leaf_after_not_after() {
+        ensure_crypto_provider();
+        let verifier = build_client_cert_verifier(vec![], vec![pinned_client_cert()])
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            verify_client_cert_at(verifier.as_ref(), &pinned_client_cert(), 2096648259).is_err()
+        );
+    }
+
+    #[test]
+    fn pinned_client_verifier_rejects_pinned_leaf_without_client_auth_usage() {
+        ensure_crypto_provider();
+        let verifier = build_client_cert_verifier(vec![], vec![ca_cert()])
+            .unwrap()
+            .unwrap();
+
+        assert!(verify_client_cert_at(verifier.as_ref(), &ca_cert(), 1781308800).is_err());
     }
 }

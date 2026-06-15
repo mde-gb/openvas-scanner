@@ -130,7 +130,7 @@ Once you created the all key-certs pairs, you can use them for stablishing a mTL
 In the openvasd.toml configuration file, under the section `[tls]`:
 - set the variable `certs` with the path to the server certificate,
 - set the variable `key` with the path to the server key,
-- set the variable `pinned_client_certs` with the path to the file or folder with all registered client's exact leaf certificates, previously shared via a secure method.
+- set the variable `pinned_client_certs` with the path to the file or folder with all registered client's exact leaf certificates, previously shared via a secure method. Pinned leaf certificates must be time-valid TLS client certificates with the `clientAuth` extended key usage.
 
 On the client side, you use the client key and the client certificate. An example of usage is the following curl command:
 
@@ -138,7 +138,7 @@ On the client side, you use the client key and the client certificate. An exampl
 
 As can be seen, no CA certificate is used, since instead the client certificate is used on the server side.
 
-`client_certs` and `pinned_client_certs` can be used together. In that mode `client_certs` keeps normal CA based client certificate validation, while `pinned_client_certs` accepts only exact configured client leaf certificates without trusting their issuing CA for other clients.
+`client_certs` and `pinned_client_certs` can be used together. In that mode `client_certs` keeps normal CA based client certificate validation, while `pinned_client_certs` accepts only exact configured, time-valid client leaf certificates with `clientAuth` extended key usage without trusting their issuing CA for other clients.
 
 ## Mode
 
