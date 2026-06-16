@@ -29,7 +29,6 @@ jobs:
       runner: ubuntu-latest
       binary_version: ${{ inputs.binary_version }}
   rs-arm64:
-    if: github.event_name != 'pull_request'
     uses: ./.github/workflows/build-rs.yaml
     with:
       arch: arm64
