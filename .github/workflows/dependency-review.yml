@@ -11,4 +11,3 @@ jobs:
     steps:
       - name: 'Dependency Review'
         uses: greenbone/actions/dependency-review@v3
-        continue-on-error: true
